@@ -130,7 +130,7 @@ services:
     extends:
       service: attendee-worker
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 768m
     group_add:
       - "${DOCKER_SOCKET_GID:-996}"
     volumes:

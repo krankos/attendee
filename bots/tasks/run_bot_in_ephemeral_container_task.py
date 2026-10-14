@@ -2,9 +2,9 @@ import logging
 import os
 
 import docker
-from celery import shared_task
+from celery import Task, shared_task
 
-from bots.models import Bot, BotEventManager, BotEventSubTypes, BotEventTypes
+from bots.models import Bot, BotEventManager, BotEventSubTypes, BotEventTypes, BotStates
 
 logger = logging.getLogger(__name__)
 
@@ -13,8 +13,23 @@ class BotLauncherCapacityError(Exception):
     """Raised when the maximum number of simultaneous bots is reached."""
 
 
+class BotLauncherTask(Task):
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        try:
+            bot = Bot.objects.get(id=args[0] if args else kwargs["bot_id"])
+            if bot.state not in {BotStates.ENDED, BotStates.FATAL_ERROR, BotStates.DATA_DELETED}:
+                BotEventManager.create_event(
+                    bot=bot,
+                    event_type=BotEventTypes.FATAL_ERROR,
+                    event_sub_type=BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED,
+                )
+        except Exception:
+            logger.exception("Unable to persist isolated bot launcher failure")
+
+
 @shared_task(
     bind=True,
+    base=BotLauncherTask,
     autoretry_for=(BotLauncherCapacityError,),
     retry_backoff=True,
     retry_backoff_max=60,
@@ -203,9 +218,4 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
         raise  # Celery retries capacity exhaustion without declaring failure.
     except Exception as e:
         logger.error(f"Error launching ephemeral container for bot {bot_id}: {str(e)}", exc_info=True)
-        BotEventManager.create_event(
-            bot=Bot.objects.get(id=bot_id),
-            event_type=BotEventTypes.FATAL_ERROR,
-            event_sub_type=BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED,
-        )
         raise
