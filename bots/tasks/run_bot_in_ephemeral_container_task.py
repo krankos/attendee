@@ -4,7 +4,7 @@ import os
 import docker
 from celery import shared_task
 
-from bots.models import Bot
+from bots.models import Bot, BotEventManager, BotEventSubTypes, BotEventTypes
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,10 @@ class BotLauncherCapacityError(Exception):
     bind=True,
     autoretry_for=(BotLauncherCapacityError,),
     retry_backoff=True,
-    max_retries=6,
+    retry_backoff_max=60,
+    max_retries=12,
+    acks_late=True,
+    reject_on_worker_lost=True,
 )
 def run_bot_in_ephemeral_container(self, bot_id: int):
     """
@@ -32,6 +35,18 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
     try:
         # Connect to Docker daemon
         client = docker.from_env()
+
+        # A launcher restart or lost Docker response may redeliver this task.
+        bot = Bot.objects.get(id=bot_id)
+        container_name = bot.ephemeral_container_name()
+        try:
+            existing = client.containers.get(container_name)
+        except docker.errors.NotFound:
+            existing = None
+        if existing is not None:
+            if existing.status in {"created", "running", "restarting"}:
+                return {"container_id": existing.short_id, "container_name": container_name, "bot_id": bot_id, "status": "already_started"}
+            raise RuntimeError("Previous isolated bot container requires inspection before relaunch")
 
         # Check maximum simultaneous bots limit
         max_simultaneous_bots = int(os.getenv("BOT_MAX_SIMULTANEOUS_BOTS", "100"))
@@ -63,6 +78,10 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
             "PULSE_SERVER",  # Each ephemeral container should start its own PulseAudio server
             "PULSE_RUNTIME_PATH",  # Each container has its own runtime path
             "XDG_RUNTIME_DIR",  # Each container has its own runtime dir
+            "HOSTNAME",
+            "DOCKER_HOST",
+            "DOCKER_TLS_VERIFY",
+            "DOCKER_CERT_PATH",
         }
         env_vars = {k: v for k, v in env_vars.items() if k not in vars_to_exclude}
 
@@ -72,12 +91,27 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
         cpu_period = int(os.getenv("BOT_CPU_PERIOD", "100000"))
 
         # Get bot to retrieve max_uptime_seconds (Bot.DoesNotExist propagates)
-        bot = Bot.objects.get(id=bot_id)
         automatic_leave_settings = bot.automatic_leave_settings()
         bot_max_uptime = automatic_leave_settings.get("max_uptime_seconds")
 
         # Container name
-        container_name = bot.ephemeral_container_name()
+        network = os.getenv("BOT_CONTAINER_NETWORK")
+        if not network or network == "host":
+            raise RuntimeError("BOT_CONTAINER_NETWORK must name the application's private Docker bridge network")
+
+        # Account for memory a running bot has reserved but has not allocated
+        # yet, preserving headroom for other applications on this shared host.
+        requested_memory = docker.utils.parse_bytes(mem_limit)
+        headroom = docker.utils.parse_bytes(os.getenv("BOT_HOST_MEMORY_HEADROOM", "1g"))
+        with open("/proc/meminfo", encoding="utf-8") as meminfo:
+            available_memory = next(int(line.split()[1]) * 1024 for line in meminfo if line.startswith("MemAvailable:"))
+        reserved_memory = 0
+        for running in running_containers:
+            limit = running.attrs.get("HostConfig", {}).get("Memory", 0)
+            usage = running.stats(stream=False).get("memory_stats", {}).get("usage", 0)
+            reserved_memory += max(0, limit - usage)
+        if available_memory - reserved_memory < requested_memory + headroom:
+            raise BotLauncherCapacityError("Insufficient host memory for another isolated bot")
 
         # Calculate timeout = max_uptime_seconds + 1h (3600s) if defined, otherwise use default
         if bot_max_uptime is not None:
@@ -104,8 +138,10 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
         # Mount volumes (same as worker for code access)
         # Get the host path - if we're in a container, use env var or detect from mounted volume
         # The worker runs with .:/attendee mounted, so we need the host path
-        host_code_path = os.getenv("BOT_HOST_CODE_PATH", "/opt/attendee")
-        volumes = {host_code_path: {"bind": "/attendee", "mode": "rw"}}
+        # Use the code baked into the selected image. A default host bind mount
+        # can hide manage.py entirely on a Coolify server.
+        host_code_path = os.getenv("BOT_HOST_CODE_PATH")
+        volumes = {host_code_path: {"bind": "/attendee", "mode": "ro"}} if host_code_path else {}
 
         # Launch ephemeral container
         container = client.containers.run(
@@ -120,7 +156,9 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
             mem_limit=mem_limit,
             cpu_quota=cpu_quota,
             cpu_period=cpu_period,
-            network_mode="host",  # Same network mode as workers
+            network=network,
+            shm_size=os.getenv("BOT_SHM_SIZE", "256m"),
+            log_config=docker.types.LogConfig(type="json-file", config={"max-size": "10m", "max-file": "3"}),
             security_opt=["seccomp=unconfined"],  # Same config as workers
             # Container will automatically stop after max_execution_seconds thanks to timeout in command
         )
@@ -161,6 +199,13 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
     except docker.errors.APIError as e:
         logger.error(f"Docker API error while launching bot {bot_id}: {str(e)}")
         raise
+    except BotLauncherCapacityError:
+        raise  # Celery retries capacity exhaustion without declaring failure.
     except Exception as e:
         logger.error(f"Error launching ephemeral container for bot {bot_id}: {str(e)}", exc_info=True)
+        BotEventManager.create_event(
+            bot=Bot.objects.get(id=bot_id),
+            event_type=BotEventTypes.FATAL_ERROR,
+            event_sub_type=BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED,
+        )
         raise
