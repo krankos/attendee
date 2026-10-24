@@ -165,12 +165,15 @@ class GoogleMeetUIMethods:
         element_text = denied_your_request_element.text
 
         if any(text in element_text for text in actively_denied_texts):
+            self.join_diagnostics.emit("admission_failed", level=logging.WARNING, reason="host_denied", step=step)
             logger.warning("Someone in the call actively denied our request to join. Raising UiRequestToJoinDeniedException")
             raise UiRequestToJoinDeniedException("Someone in the call denied your request to join", step)
         elif any(text in element_text for text in no_one_responded_texts):
+            self.join_diagnostics.emit("admission_failed", level=logging.WARNING, reason="no_response_timeout", step=step)
             logger.warning("No one responded to our request to join (timeout). Raising UiRequestToJoinDeniedException")
             raise UiRequestToJoinDeniedException("No one responded to your request to join the call", step)
         else:  # "You left the meeting"
+            self.join_diagnostics.emit("admission_failed", level=logging.WARNING, reason="left_meeting_screen", step=step)
             logger.warning("Saw 'You left the meeting' element. Happens if someone actively denied our request to join. Raising UiRequestToJoinDeniedException")
             raise UiRequestToJoinDeniedException("You left the meeting", step)
 
@@ -1179,12 +1182,14 @@ class GoogleMeetUIMethods:
             condition=EC.presence_of_element_located((By.XPATH, self.join_now_button_selector())),
             wait_time_seconds=60,
         )
+        self.join_diagnostics.emit("admission_click_started")
         logger.info("Clicking the join button...")
         if self.ui_interaction_mode == "humanized":
             self.humanized_navigate_to_and_click_element(join_button)
         else:
             self.click_element_with_fallback_to_forceful_click(join_button, "join_button")
 
+        self.join_diagnostics.emit("admission_click_completed")
         self.click_captions_button()
 
         self.wait_for_host_if_needed()

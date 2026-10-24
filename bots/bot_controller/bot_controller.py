@@ -21,6 +21,7 @@ from bots.bot_controller.main_thread_executor import MainThreadExecutor
 from bots.bot_sso_utils import create_google_meet_sign_in_session
 from bots.bots_api_utils import BotCreationSource
 from bots.external_callback_utils import get_zoom_tokens
+from bots.join_diagnostics import bot_log_context
 from bots.meeting_url_utils import meeting_type_from_url, parse_zoom_registrant_token
 from bots.models import (
     AudioChunk,
@@ -990,6 +991,9 @@ class BotController:
         self.room_sync_client = self.get_room_sync_client()
 
         self.adapter = self.get_bot_adapter()
+        if hasattr(self.adapter, "join_diagnostics"):
+            self.adapter.join_diagnostics.context.update(bot_log_context(self.bot_in_db))
+            self.adapter.join_diagnostics.emit("bot_runtime_started")
 
         self.audio_output_manager = AudioOutputManager(
             currently_playing_audio_media_request_finished_callback=self.currently_playing_audio_media_request_finished,

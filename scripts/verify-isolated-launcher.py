@@ -12,6 +12,10 @@ from bots.tasks.run_bot_in_ephemeral_container_task import BotLauncherCapacityEr
 class IsolationTests(unittest.TestCase):
     def setUp(self):
         self.bot = MagicMock()
+        self.bot.id = 42
+        self.bot.object_id = "bot-fixture"
+        self.bot.metadata = {"meeting_bot_id": "local-row"}
+        self.bot.meeting_url = "https://meet.google.com/test"
         self.bot.ephemeral_container_name.return_value = "attendee-isolation-fixture"
         self.bot.automatic_leave_settings.return_value = {"max_uptime_seconds": 900}
         self.client = MagicMock()
