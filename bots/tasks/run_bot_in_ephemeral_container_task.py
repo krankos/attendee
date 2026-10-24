@@ -1,9 +1,11 @@
 import logging
 import os
+import uuid
 
 import docker
 from celery import Task, shared_task
 
+from bots.join_diagnostics import bot_log_context, log_diagnostic
 from bots.models import Bot, BotEventManager, BotEventSubTypes, BotEventTypes, BotStates
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,16 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
     Container auto-removes on exit.
     Celery task returns in ~2 seconds.
     """
+    launch_id = str(uuid.uuid4())
+    request = self.request
+    diagnostic_context = {
+        "bot_id": bot_id,
+        "launch_id": launch_id,
+        "launcher_task_id": request.id,
+        "task_retries": request.retries,
+        "redelivered": bool((request.delivery_info or {}).get("redelivered")),
+    }
+    log_diagnostic("launcher_received", diagnostic_context)
     logger.info(f"Launching ephemeral Docker container for bot {bot_id}")
 
     try:
@@ -53,6 +65,7 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
 
         # A launcher restart or lost Docker response may redeliver this task.
         bot = Bot.objects.get(id=bot_id)
+        diagnostic_context.update(bot_log_context(bot))
         container_name = bot.ephemeral_container_name()
         try:
             existing = client.containers.get(container_name)
@@ -60,6 +73,7 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
             existing = None
         if existing is not None:
             if existing.status in {"created", "running", "restarting"}:
+                log_diagnostic("launcher_reused_container", diagnostic_context, level=logging.WARNING, container_id=existing.short_id, container_name=container_name, container_status=existing.status)
                 return {"container_id": existing.short_id, "container_name": container_name, "bot_id": bot_id, "status": "already_started"}
             raise RuntimeError("Previous isolated bot container requires inspection before relaunch")
 
@@ -99,6 +113,8 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
             "DOCKER_CERT_PATH",
         }
         env_vars = {k: v for k, v in env_vars.items() if k not in vars_to_exclude}
+        env_vars["BOT_DIAGNOSTIC_LAUNCH_ID"] = launch_id
+        env_vars["BOT_DIAGNOSTIC_TASK_ID"] = request.id or ""
 
         # Resource limits per bot (configurable)
         mem_limit = os.getenv("BOT_MEMORY_LIMIT", "2g")  # 2GB default
@@ -178,6 +194,8 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
             # Container will automatically stop after max_execution_seconds thanks to timeout in command
         )
 
+        log_diagnostic("container_started", diagnostic_context, container_id=container.short_id, container_name=container_name, image=image, auto_remove=auto_remove)
+
         # Log container info and how to view logs
         log_instruction = f"View logs with: docker logs -f {container_name}" if not auto_remove else "Container will auto-remove when done. To keep containers, set BOT_CONTAINER_AUTO_REMOVE=false"
 
@@ -212,9 +230,11 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
         logger.error(f"Image {image} not found. Cannot launch bot {bot_id}")
         raise
     except docker.errors.APIError as e:
+        log_diagnostic("launcher_failed", diagnostic_context, level=logging.ERROR, exception_class=type(e).__name__, docker_status=getattr(e, "status_code", None))
         logger.error(f"Docker API error while launching bot {bot_id}: {str(e)}")
         raise
     except BotLauncherCapacityError:
+        log_diagnostic("launcher_capacity_retry", diagnostic_context, level=logging.WARNING)
         raise  # Celery retries capacity exhaustion without declaring failure.
     except Exception as e:
         logger.error(f"Error launching ephemeral container for bot {bot_id}: {str(e)}", exc_info=True)
