@@ -525,6 +525,68 @@ class GoogleMeetUIMethods:
         WebDriverWait(self.driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Captions and translation"][aria-pressed="true"]')))
         logger.info("Confirmed captions were enabled")
 
+    # Only rendered once the bot is inside the call; the waiting room toolbar
+    # has just the microphone, camera, more options and leave buttons.
+    IN_CALL_SELECTOR = 'button[aria-label="Turn on captions"], button[aria-label="Turn off captions"], button[aria-label="Captions and translation"], button[aria-label^="Raise hand"], button[aria-label="Send a reaction"]'
+    CAPTIONS_BUTTON_SELECTOR = 'button[aria-label="Turn on captions"], button[aria-label="Turn off captions"], button[aria-label="Captions and translation"]'
+
+    def is_in_call(self):
+        try:
+            return bool(self.driver.find_elements(By.CSS_SELECTOR, self.IN_CALL_SELECTOR))
+        except Exception as e:
+            logger.info(f"Could not check for in-call controls. Exception type = {type(e)}")
+            return False
+
+    def wait_until_admitted(self):
+        logger.info("Waiting to be admitted...")
+        waiting_room_timeout_started_at = time.time()
+        # Same overall budget as the captions loop this replaces.
+        deadline = waiting_room_timeout_started_at + self.automatic_leave_configuration.waiting_room_timeout_seconds * 2
+        last_slow_checks_at = 0.0
+        while True:
+            if self.is_in_call():
+                logger.info("Admitted to the meeting")
+                return
+
+            # Full-page text searches are slow on Meet, so they run every 2s
+            # while the cheap in-call check runs every 0.25s.
+            if time.time() - last_slow_checks_at >= 2:
+                last_slow_checks_at = time.time()
+                self.look_for_blocked_element("wait_until_admitted")
+                self.look_for_denied_your_request_element("wait_until_admitted")
+                self.click_this_meeting_is_being_recorded_join_now_button("wait_until_admitted")
+                self.click_others_may_see_your_meeting_differently_button("wait_until_admitted")
+                self.check_if_waiting_room_timeout_exceeded(waiting_room_timeout_started_at, "wait_until_admitted")
+
+            if time.time() > deadline:
+                self.look_for_asking_to_be_let_in_element_after_waiting_period_expired("wait_until_admitted")
+                logger.warning("Was not admitted before the deadline. Raising UiCouldNotLocateElementException")
+                raise UiCouldNotLocateElementException("Was not admitted before the deadline.", "wait_until_admitted")
+
+            time.sleep(0.25)
+
+    def enable_captions_best_effort(self, timeout_seconds=15):
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            self.click_this_meeting_is_being_recorded_join_now_button("enable_captions")
+            self.click_others_may_see_your_meeting_differently_button("enable_captions")
+            buttons = self.driver.find_elements(By.CSS_SELECTOR, self.CAPTIONS_BUTTON_SELECTOR)
+            if buttons:
+                captions_button = buttons[0]
+                label = captions_button.get_attribute("aria-label")
+                if label == "Turn off captions":
+                    logger.info("Captions are already enabled")
+                    return
+                if label == "Captions and translation":
+                    self.enable_captions_via_keyboard_shortcut(captions_button)
+                    return
+                self.click_element(captions_button, "click_captions_button")
+                WebDriverWait(self.driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Turn off captions"]')))
+                logger.info("Confirmed captions were enabled")
+                return
+            time.sleep(0.5)
+        logger.warning("Captions button not found after joining. Continuing without captions.")
+
     def click_captions_button(self):
         num_attempts_to_look_for_captions_button = self.automatic_leave_configuration.waiting_room_timeout_seconds * 2
         logger.info("Waiting for captions button...")
@@ -1198,23 +1260,30 @@ class GoogleMeetUIMethods:
         else:
             self.click_element_with_fallback_to_forceful_click(join_button, "join_button")
 
-        self.click_captions_button()
+        self.wait_until_admitted()
 
-        self.wait_for_host_if_needed()
+        # Audio is only kept once the bot counts as joined, so the remaining
+        # setup runs after that point (see after_admitted_setup).
+        self.layout_to_select_after_admission = layout_to_select
 
+    def after_admitted_setup(self):
+        steps = [("enable_captions", self.enable_captions_best_effort)]
         if not self.disable_incoming_video:
-            self.set_layout(layout_to_select)
-
+            steps.append(("set_layout", lambda: self.set_layout(self.layout_to_select_after_admission)))
         if self.disable_incoming_video:
-            self.disable_incoming_video_in_ui()
-
+            steps.append(("disable_incoming_video_in_ui", self.disable_incoming_video_in_ui))
         if self.google_meet_closed_captions_language:
-            self.select_language(self.google_meet_closed_captions_language)
-
+            steps.append(("select_language", lambda: self.select_language(self.google_meet_closed_captions_language)))
         if os.getenv("DO_NOT_RECORD_MEETING_REACTIONS") == "true":
-            self.turn_off_reactions()
+            steps.append(("turn_off_reactions", self.turn_off_reactions))
+        steps.append(("ready_to_show_bot_image", self.ready_to_show_bot_image))
 
-        self.ready_to_show_bot_image()
+        # The bot is already recording here; a failed step must not end the call.
+        for name, step in steps:
+            try:
+                step()
+            except Exception as e:
+                logger.warning(f"Post-admission step {name} failed with {type(e).__name__}: {e}. Continuing.")
 
     def verify_expected_audio_configuration(self):
         # Just in case we don't want to run this check anymore, we'll have an env var to bypass it.

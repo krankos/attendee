@@ -104,6 +104,7 @@ class GoogleMeetBotAdapter(WebBotAdapter, GoogleMeetUIMethods):
 
     def subclass_specific_after_bot_joined_meeting(self):
         self.after_bot_can_record_meeting()
+        self.after_admitted_setup()
 
     def add_subclass_specific_chrome_options(self, options):
         # Prevents a speedbump when signing in to Google Meet.
