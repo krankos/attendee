@@ -24,6 +24,7 @@ from websockets.sync.server import serve
 from bots.automatic_leave_configuration import AutomaticLeaveConfiguration
 from bots.automatic_leave_utils import participant_is_another_bot
 from bots.bot_adapter import BotAdapter
+from bots.join_diagnostics import JoinDiagnostics
 from bots.models import ParticipantEventTypes, RecordingViews
 from bots.per_participant_realtime_video_configuration import PerParticipantRealtimeVideoConfiguration
 from bots.room_sync_source_participant_configuration import RoomSyncSourceParticipantConfiguration
@@ -84,6 +85,7 @@ class WebBotAdapter(BotAdapter):
         self.disable_incoming_video = disable_incoming_video
         self.record_participant_speech_start_stop_events = record_participant_speech_start_stop_events
         self.meeting_url = meeting_url
+        self.join_diagnostics = JoinDiagnostics(meeting_url, self.display_name)
 
         # This is an internal ID that comes from the platform. It is currently only used for MS Teams.
         self.meeting_uuid = None
@@ -208,6 +210,8 @@ class WebBotAdapter(BotAdapter):
     def handle_participant_update(self, user):
         if self.meeting_uuid_mismatch(user):
             return
+
+        self.join_diagnostics.participant_update(user)
 
         user_before = self.participants_info.get(user["deviceId"], {"active": False, "isHost": bool(user.get("isHost"))})
         self.participants_info[user["deviceId"]] = user
@@ -360,6 +364,7 @@ class WebBotAdapter(BotAdapter):
         self.remover = json_data["remover"]
 
     def handle_removed_from_meeting(self):
+        self.join_diagnostics.emit("removed_from_meeting")
         self.left_meeting = True
         self.send_message_callback({"message": self.Messages.MEETING_ENDED, "remover": self.remover})
 
@@ -981,9 +986,16 @@ class WebBotAdapter(BotAdapter):
         authorized_user_not_in_meeting_first_seen_at = None
 
         while num_retries <= max_retries:
+            self.join_diagnostics.begin_attempt(policy_retries=num_retries, expected_exceptions=num_expected_exceptions)
             try:
-                self.init_driver()
-                self.attempt_to_join_meeting()
+                try:
+                    self.init_driver()
+                    self.join_diagnostics.emit("browser_ready", browser_session_id=getattr(self.driver, "session_id", None))
+                    self.attempt_to_join_meeting()
+                except Exception as exception:
+                    self.join_diagnostics.failed(exception)
+                    raise
+                self.join_diagnostics.emit("join_succeeded")
                 logger.info("Successfully joined meeting")
                 break
 
@@ -1119,6 +1131,7 @@ class WebBotAdapter(BotAdapter):
             self.debug_screen_recorder.stop()
 
     def leave(self):
+        self.join_diagnostics.emit("leave_requested", already_left=self.left_meeting)
         if self.left_meeting:
             return
         if self.was_removed_from_meeting:
@@ -1154,6 +1167,7 @@ class WebBotAdapter(BotAdapter):
             logger.warning(f"Error closing driver: {e}")
 
     def cleanup(self):
+        self.join_diagnostics.emit("bot_runtime_cleanup", self_join_count=self.join_diagnostics.self_joins, left_meeting=self.left_meeting)
         if self.stop_recording_screen_callback:
             self.stop_recording_screen_callback()
 

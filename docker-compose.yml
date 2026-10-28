@@ -1,7 +1,7 @@
 services:
   attendee-app:
     build: .
-    image: attendee:latest
+    image: attendee:isolated-v1
     restart: unless-stopped
     expose:
       - "8000"
@@ -28,6 +28,7 @@ services:
       ENABLE_CHROME_SANDBOX: ${ENABLE_CHROME_SANDBOX:-false}
       DISABLE_EMAIL: ${DISABLE_EMAIL:-true}
       DJANGO_SSL_REQUIRE: ${DJANGO_SSL_REQUIRE:-true}
+      LAUNCH_BOT_METHOD: docker-compose-multi-host
     command:
       - gunicorn
       - attendee.wsgi:application
@@ -45,7 +46,7 @@ services:
 
   attendee-worker:
     build: .
-    image: attendee:latest
+    image: attendee:isolated-v1
     restart: unless-stopped
     shm_size: "2gb"
     environment:
@@ -71,6 +72,7 @@ services:
       ENABLE_CHROME_SANDBOX: ${ENABLE_CHROME_SANDBOX:-false}
       DISABLE_EMAIL: ${DISABLE_EMAIL:-true}
       DJANGO_SSL_REQUIRE: ${DJANGO_SSL_REQUIRE:-true}
+      LAUNCH_BOT_METHOD: docker-compose-multi-host
     command:
       - celery
       - -A
@@ -78,7 +80,7 @@ services:
       - worker
       - -l
       - INFO
-      - --concurrency=1
+      - --concurrency=2
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,7 +89,7 @@ services:
 
   attendee-scheduler:
     build: .
-    image: attendee:latest
+    image: attendee:isolated-v1
     restart: unless-stopped
     entrypoint: null
     environment:
@@ -113,6 +115,7 @@ services:
       ENABLE_CHROME_SANDBOX: ${ENABLE_CHROME_SANDBOX:-false}
       DISABLE_EMAIL: ${DISABLE_EMAIL:-true}
       DJANGO_SSL_REQUIRE: ${DJANGO_SSL_REQUIRE:-true}
+      LAUNCH_BOT_METHOD: docker-compose-multi-host
     command:
       - python
       - manage.py
@@ -122,6 +125,33 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  attendee-launcher:
+    extends:
+      service: attendee-worker
+    restart: unless-stopped
+    mem_limit: 768m
+    group_add:
+      - "${DOCKER_SOCKET_GID:-996}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      BOT_CONTAINER_IMAGE: ${BOT_CONTAINER_IMAGE:-attendee:isolated-v1}
+      BOT_CONTAINER_NETWORK: ${BOT_CONTAINER_NETWORK}
+      BOT_MAX_SIMULTANEOUS_BOTS: "2"
+      BOT_MEMORY_LIMIT: 1280m
+      BOT_HOST_MEMORY_HEADROOM: 1g
+      BOT_CONTAINER_AUTO_REMOVE: "false"
+    command:
+      - celery
+      - -A
+      - attendee
+      - worker
+      - -l
+      - INFO
+      - --concurrency=1
+      - --queues=bot_launcher_vm
+      - --hostname=launcher@%h
 
   postgres:
     image: postgres:15.3-alpine

@@ -165,12 +165,15 @@ class GoogleMeetUIMethods:
         element_text = denied_your_request_element.text
 
         if any(text in element_text for text in actively_denied_texts):
+            self.join_diagnostics.emit("admission_failed", level=logging.WARNING, reason="host_denied", step=step)
             logger.warning("Someone in the call actively denied our request to join. Raising UiRequestToJoinDeniedException")
             raise UiRequestToJoinDeniedException("Someone in the call denied your request to join", step)
         elif any(text in element_text for text in no_one_responded_texts):
+            self.join_diagnostics.emit("admission_failed", level=logging.WARNING, reason="no_response_timeout", step=step)
             logger.warning("No one responded to our request to join (timeout). Raising UiRequestToJoinDeniedException")
             raise UiRequestToJoinDeniedException("No one responded to your request to join the call", step)
         else:  # "You left the meeting"
+            self.join_diagnostics.emit("admission_failed", level=logging.WARNING, reason="left_meeting_screen", step=step)
             logger.warning("Saw 'You left the meeting' element. Happens if someone actively denied our request to join. Raising UiRequestToJoinDeniedException")
             raise UiRequestToJoinDeniedException("You left the meeting", step)
 
@@ -515,14 +518,27 @@ class GoogleMeetUIMethods:
                 logger.warning(f"Could not find name input. Unknown error {e} of type {type(e)}. Raising UiCouldNotLocateElementException")
                 raise UiCouldNotLocateElementException("Could not find name input. Unknown error.", "name_input", e)
 
+    def enable_captions_via_keyboard_shortcut(self, captions_button):
+        if captions_button.get_attribute("aria-pressed") == "true":
+            logger.info("Captions and translation button is already pressed, captions are already enabled")
+            return
+        logger.info("Found 'Captions and translation' variant of captions button. Pressing 'c' to enable captions...")
+        ActionChains(self.driver).send_keys("c").perform()
+        logger.info("Waiting for captions to be enabled...")
+        WebDriverWait(self.driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Captions and translation"][aria-pressed="true"]')))
+        logger.info("Confirmed captions were enabled")
+
     def click_captions_button(self):
         num_attempts_to_look_for_captions_button = self.automatic_leave_configuration.waiting_room_timeout_seconds * 2
         logger.info("Waiting for captions button...")
         waiting_room_timeout_started_at = time.time()
         for attempt_to_look_for_captions_button_index in range(num_attempts_to_look_for_captions_button):
             try:
-                captions_button = WebDriverWait(self.driver, 1).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Turn on captions"]')))
+                captions_button = WebDriverWait(self.driver, 1).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Turn on captions"], button[aria-label="Captions and translation"]')))
                 logger.info("Captions button found")
+                if captions_button.get_attribute("aria-label") == "Captions and translation":
+                    self.enable_captions_via_keyboard_shortcut(captions_button)
+                    return
                 self.click_element(captions_button, "click_captions_button")
                 logger.info("Waiting for captions to be enabled...")
                 WebDriverWait(self.driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Turn off captions"]')))
@@ -1179,12 +1195,14 @@ class GoogleMeetUIMethods:
             condition=EC.presence_of_element_located((By.XPATH, self.join_now_button_selector())),
             wait_time_seconds=60,
         )
+        self.join_diagnostics.emit("admission_click_started")
         logger.info("Clicking the join button...")
         if self.ui_interaction_mode == "humanized":
             self.humanized_navigate_to_and_click_element(join_button)
         else:
             self.click_element_with_fallback_to_forceful_click(join_button, "join_button")
 
+        self.join_diagnostics.emit("admission_click_completed")
         self.click_captions_button()
 
         self.wait_for_host_if_needed()
