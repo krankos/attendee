@@ -532,6 +532,10 @@ class GoogleMeetUIMethods:
 
     def is_in_call(self):
         try:
+            # The synced self participant must explicitly be in_meeting. A
+            # host's presence alone can also be visible from the waiting room.
+            if self.driver.execute_script("return window.userManager?.getCurrentUsersInMeeting()?.some(user => user.isCurrentUser && user.humanized_status === 'in_meeting') === true;") is True:
+                return True
             return bool(self.driver.find_elements(By.CSS_SELECTOR, self.IN_CALL_SELECTOR))
         except Exception as e:
             logger.info(f"Could not check for in-call controls. Exception type = {type(e)}")
@@ -552,10 +556,17 @@ class GoogleMeetUIMethods:
             # while the cheap in-call check runs every 0.25s.
             if time.time() - last_slow_checks_at >= 2:
                 last_slow_checks_at = time.time()
-                self.look_for_blocked_element("wait_until_admitted")
-                self.look_for_denied_your_request_element("wait_until_admitted")
-                self.click_this_meeting_is_being_recorded_join_now_button("wait_until_admitted")
-                self.click_others_may_see_your_meeting_differently_button("wait_until_admitted")
+                # Avoid four expensive full-page XPath searches on every
+                # round. Only inspect a notice when its text is present.
+                text = self.driver.execute_script("return document.body.innerText;") or ""
+                if "You can't join this video call" in text or "There is a problem connecting" in text:
+                    self.look_for_blocked_element("wait_until_admitted")
+                if "request to join" in text or "You left the meeting" in text:
+                    self.look_for_denied_your_request_element("wait_until_admitted")
+                if "Join now" in text or "being captured" in text:
+                    self.click_this_meeting_is_being_recorded_join_now_button("wait_until_admitted")
+                if "Got it" in text:
+                    self.click_others_may_see_your_meeting_differently_button("wait_until_admitted")
                 self.check_if_waiting_room_timeout_exceeded(waiting_room_timeout_started_at, "wait_until_admitted")
 
             if time.time() > deadline:
