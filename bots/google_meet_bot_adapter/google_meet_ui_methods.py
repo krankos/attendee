@@ -43,6 +43,14 @@ class UiMocapSequenceNotAvailableException(UiRetryableExpectedException):
         super().__init__(message, step, inner_exception)
 
 
+# Meet drops a knock after ~10.5 minutes with nobody answering. The join flow
+# knocks again while the waiting room budget lasts; if this escapes, it is
+# still reported as a denied request.
+class UiNoOneRespondedException(UiRequestToJoinDeniedException):
+    def __init__(self, message, step=None, inner_exception=None):
+        super().__init__(message, step, inner_exception)
+
+
 class GoogleMeetUIMethods:
     def locate_element(self, step, condition, wait_time_seconds=60):
         try:
@@ -141,6 +149,25 @@ class GoogleMeetUIMethods:
             logger.warning(f"Google is blocking us for whatever reason, but we can retry. Element text: '{element_text}'. Raising UiGoogleBlockingUsException")
             raise UiGoogleBlockingUsException("You can't join this video call", step)
 
+    # Text Meet shows once the bot is out of the waiting room without being
+    # admitted. The self participant sync can briefly report in_meeting while
+    # one of these is on screen, so admission is only trusted without them.
+    EXIT_NOTICE_TEXTS = (
+        "your request to join",
+        "You left the meeting",
+        "Returning to home screen",
+        "You've been removed",
+        "You can't join this video call",
+    )
+
+    def exit_notice_on_page(self):
+        try:
+            text = self.driver.execute_script("return document.body.innerText;") or ""
+        except Exception as e:
+            logger.info(f"Could not read page text. Exception type = {type(e)}")
+            return False
+        return any(notice in text for notice in self.EXIT_NOTICE_TEXTS)
+
     def look_for_login_required_element(self, step):
         login_required_element = self.find_element_by_selector(By.XPATH, '//h1[contains(., "Sign in")]/parent::*[.//*[contains(text(), "your Google Account")]]')
         if login_required_element:
@@ -168,8 +195,8 @@ class GoogleMeetUIMethods:
             logger.warning("Someone in the call actively denied our request to join. Raising UiRequestToJoinDeniedException")
             raise UiRequestToJoinDeniedException("Someone in the call denied your request to join", step)
         elif any(text in element_text for text in no_one_responded_texts):
-            logger.warning("No one responded to our request to join (timeout). Raising UiRequestToJoinDeniedException")
-            raise UiRequestToJoinDeniedException("No one responded to your request to join the call", step)
+            logger.warning("No one responded to our request to join (Meet's own knock timeout). Raising UiNoOneRespondedException")
+            raise UiNoOneRespondedException("No one responded to your request to join the call", step)
         else:  # "You left the meeting"
             logger.warning("Saw 'You left the meeting' element. Happens if someone actively denied our request to join. Raising UiRequestToJoinDeniedException")
             raise UiRequestToJoinDeniedException("You left the meeting", step)
@@ -480,6 +507,11 @@ class GoogleMeetUIMethods:
                 name_input = self.retrieve_name_input_element()
                 self.check_for_failed_logged_in_bot_attempt()
                 logger.info("name input found")
+                # A knock after the first can find the previous name still filled in.
+                if name_input.get_attribute("value"):
+                    logger.info("Name input already has a value, clearing it")
+                    name_input.send_keys(Keys.CONTROL, "a")
+                    name_input.send_keys(Keys.BACKSPACE)
                 if self.ui_interaction_mode == "humanized":
                     self.humanized_navigate_to_and_click_element(name_input)
                     logger.info("Name input clicked")
@@ -541,16 +573,36 @@ class GoogleMeetUIMethods:
             logger.info(f"Could not check for in-call controls. Exception type = {type(e)}")
             return False
 
-    def wait_until_admitted(self):
+    ADMISSION_CONFIRMATION_SECONDS = 1.5
+
+    def admission_is_confirmed(self):
+        # On 2026-11-08 a bot counted as joined at the exact moment Meet showed
+        # "No one responded to your request to join the call", then sat on that
+        # dead page for 30 minutes. Only trust admission that survives a short
+        # wait with no exit notice on the page.
+        time.sleep(self.ADMISSION_CONFIRMATION_SECONDS)
+        if self.exit_notice_on_page():
+            logger.warning("Looked admitted, but an exit notice is on the page")
+            return False
+        if not self.is_in_call():
+            logger.warning("Looked admitted, but no longer in the call after the confirmation wait")
+            return False
+        return True
+
+    def wait_until_admitted(self, waiting_room_timeout_started_at=None):
         logger.info("Waiting to be admitted...")
-        waiting_room_timeout_started_at = time.time()
+        if waiting_room_timeout_started_at is None:
+            waiting_room_timeout_started_at = time.time()
         # Same overall budget as the captions loop this replaces.
         deadline = waiting_room_timeout_started_at + self.automatic_leave_configuration.waiting_room_timeout_seconds * 2
         last_slow_checks_at = 0.0
         while True:
             if self.is_in_call():
-                logger.info("Admitted to the meeting")
-                return
+                if self.admission_is_confirmed():
+                    logger.info("Admitted to the meeting")
+                    return
+                # Let the slow checks below classify the page right away.
+                last_slow_checks_at = 0.0
 
             # Full-page text searches are slow on Meet, so they run every 2s
             # while the cheap in-call check runs every 0.25s.
@@ -1226,6 +1278,9 @@ class GoogleMeetUIMethods:
         self.x11_input.move_abs(*position)
         logger.info(f"Positioned mouse at {position}")
 
+    # Leave this much of the waiting room budget for a fresh knock to be seen.
+    MIN_SECONDS_LEFT_TO_KNOCK_AGAIN = 30
+
     # returns nothing if succeeded, raises an exception if failed
     def attempt_to_join_meeting(self):
         if self.google_meet_bot_login_is_available and self.google_meet_bot_login_should_be_used:
@@ -1236,6 +1291,33 @@ class GoogleMeetUIMethods:
         if self.ui_interaction_mode == "humanized":
             self.position_mouse_for_humanized_interaction()
 
+        # Meet drops an unanswered knock after ~10.5 minutes, well before our
+        # waiting room timeout. Knock again until that timeout is spent, so a
+        # host who is late or misses the first request can still admit us.
+        waiting_room_timeout_started_at = None
+        knock_number = 0
+        while True:
+            knock_number += 1
+            self.ask_to_join(knock_number)
+            if waiting_room_timeout_started_at is None:
+                waiting_room_timeout_started_at = time.time()
+            try:
+                self.wait_until_admitted(waiting_room_timeout_started_at)
+                break
+            except UiNoOneRespondedException:
+                seconds_left = self.automatic_leave_configuration.waiting_room_timeout_seconds - (time.time() - waiting_room_timeout_started_at)
+                if seconds_left < self.MIN_SECONDS_LEFT_TO_KNOCK_AGAIN:
+                    self.abort_join_attempt()
+                    logger.warning("No one responded and the waiting room timeout is spent. Raising UiCouldNotJoinMeetingWaitingRoomTimeoutException")
+                    raise UiCouldNotJoinMeetingWaitingRoomTimeoutException("Waiting room timeout exceeded", "wait_until_admitted")
+                logger.info(f"No one responded to knock {knock_number}. {seconds_left:.0f}s of waiting room budget left, knocking again")
+
+        # Audio is only kept once the bot counts as joined, so the remaining
+        # setup runs after that point (see after_admitted_setup).
+        self.layout_to_select_after_admission = layout_to_select
+
+    def ask_to_join(self, knock_number):
+        logger.info(f"Knock {knock_number}: opening the meeting page")
         self.driver.get(self.meeting_url)
 
         self.driver.execute_cdp_cmd(
@@ -1270,12 +1352,6 @@ class GoogleMeetUIMethods:
             self.humanized_navigate_to_and_click_element(join_button)
         else:
             self.click_element_with_fallback_to_forceful_click(join_button, "join_button")
-
-        self.wait_until_admitted()
-
-        # Audio is only kept once the bot counts as joined, so the remaining
-        # setup runs after that point (see after_admitted_setup).
-        self.layout_to_select_after_admission = layout_to_select
 
     def after_admitted_setup(self):
         steps = [("enable_captions", self.enable_captions_best_effort)]
