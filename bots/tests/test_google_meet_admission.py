@@ -1,10 +1,11 @@
 """Admission regressions; no browser or database is needed."""
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from bots.google_meet_bot_adapter.google_meet_ui_methods import GoogleMeetUIMethods, UiNoOneRespondedException
-from bots.web_bot_adapter.ui_methods import UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiRequestToJoinDeniedException
+from bots.google_meet_bot_adapter.google_meet_ui_methods import GoogleMeetUIMethods, UiKnockAgainException, UiNoOneRespondedException
+from bots.web_bot_adapter.ui_methods import UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiInfinitelyRetryableException, UiRequestToJoinDeniedException
 
 MODULE = "bots.google_meet_bot_adapter.google_meet_ui_methods"
 
@@ -91,14 +92,26 @@ class GoogleMeetKnockAgainTests(unittest.TestCase):
         bot.automatic_leave_configuration = SimpleNamespace(waiting_room_timeout_seconds=waiting_room_timeout_seconds)
         return bot
 
-    def test_knocks_again_when_no_one_responded(self):
+    def test_unanswered_knock_asks_for_a_fresh_browser(self):
         bot = self.bot()
-        bot.wait_until_admitted = MagicMock(side_effect=[UiNoOneRespondedException("no one"), None])
+        bot.wait_until_admitted = MagicMock(side_effect=UiNoOneRespondedException("no one"))
+        with self.assertRaises(UiKnockAgainException) as raised:
+            bot.attempt_to_join_meeting()
+        # Retried by the outer loop without using up its retry count.
+        self.assertIsInstance(raised.exception, UiInfinitelyRetryableException)
+        bot.abort_join_attempt.assert_not_called()
+
+    def test_second_knock_in_fresh_browser_keeps_the_budget(self):
+        bot = self.bot()
+        bot.wait_until_admitted = MagicMock(side_effect=UiNoOneRespondedException("no one"))
+        with self.assertRaises(UiKnockAgainException):
+            bot.attempt_to_join_meeting()
+        started_at = bot.waiting_room_timeout_started_at
+        bot.ask_to_join = MagicMock()
+        bot.wait_until_admitted = MagicMock(return_value=None)
         bot.attempt_to_join_meeting()
-        self.assertEqual(bot.ask_to_join.call_count, 2)
-        # Both knocks share one waiting room budget.
-        first_start = bot.wait_until_admitted.call_args_list[0].args[0]
-        self.assertEqual(bot.wait_until_admitted.call_args_list[1].args[0], first_start)
+        bot.ask_to_join.assert_called_once_with(2)
+        bot.wait_until_admitted.assert_called_once_with(started_at)
         self.assertEqual(bot.layout_to_select_after_admission, "speaker")
 
     def test_spent_budget_reports_waiting_room_timeout(self):
@@ -109,12 +122,20 @@ class GoogleMeetKnockAgainTests(unittest.TestCase):
         bot.ask_to_join.assert_called_once()
         bot.abort_join_attempt.assert_called_once()
 
+    def test_fresh_browser_with_spent_budget_does_not_knock(self):
+        bot = self.bot()
+        bot.knocks_sent = 1
+        bot.waiting_room_timeout_started_at = time.time() - 890
+        with self.assertRaises(UiCouldNotJoinMeetingWaitingRoomTimeoutException):
+            bot.attempt_to_join_meeting()
+        bot.ask_to_join.assert_not_called()
+
     def test_active_denial_is_not_retried(self):
         bot = self.bot()
         bot.wait_until_admitted = MagicMock(side_effect=UiRequestToJoinDeniedException("denied"))
-        with self.assertRaises(UiRequestToJoinDeniedException):
+        with self.assertRaises(UiRequestToJoinDeniedException) as raised:
             bot.attempt_to_join_meeting()
-        bot.ask_to_join.assert_called_once()
+        self.assertNotIsInstance(raised.exception, UiKnockAgainException)
 
 
 class GoogleMeetAdmissionConfirmationTests(unittest.TestCase):
@@ -151,14 +172,46 @@ class GoogleMeetAdmissionConfirmationTests(unittest.TestCase):
             bot.wait_until_admitted()
         self.assertEqual(bot.is_in_call.call_count, 5)
 
-    def test_refilled_name_is_cleared_first(self):
-        bot = self.bot()
-        bot.ui_interaction_mode = "default"
-        bot.google_meet_bot_login_session = None
-        bot.display_name = "Hi Talents Assistant"
-        name_input = MagicMock()
-        name_input.get_attribute.return_value = "Hi Talents Assistant"
-        bot.retrieve_name_input_element = MagicMock(return_value=name_input)
-        bot.fill_out_name_input()
-        self.assertEqual(name_input.send_keys.call_args_list[-1].args, ("Hi Talents Assistant",))
-        self.assertEqual(name_input.send_keys.call_count, 3)
+
+class GoogleMeetKnockAgainJoinLoopTests(unittest.TestCase):
+    """The real outer join loop: fresh browser per knock, ends on the budget."""
+
+    def adapter(self, ask_to_join, wait_until_admitted, waiting_room_timeout_seconds=900):
+        adapter = MagicMock()
+        adapter.left_meeting = False
+        adapter.cleaned_up = False
+        adapter.meeting_url = "https://meet.google.com/abc-defg-hij"
+        ui = GoogleMeetUIMethods()
+        ui.google_meet_bot_login_is_available = False
+        ui.ui_interaction_mode = "default"
+        ui.get_layout_to_select = MagicMock(return_value="speaker")
+        ui.abort_join_attempt = MagicMock()
+        ui.automatic_leave_configuration = SimpleNamespace(waiting_room_timeout_seconds=waiting_room_timeout_seconds)
+        ui.ask_to_join = ask_to_join
+        ui.wait_until_admitted = wait_until_admitted
+        adapter.attempt_to_join_meeting = ui.attempt_to_join_meeting
+        adapter.automatic_leave_configuration = ui.automatic_leave_configuration
+        return adapter, ui
+
+    def run_loop(self, adapter):
+        from bots.web_bot_adapter.web_bot_adapter import WebBotAdapter
+
+        with patch("bots.web_bot_adapter.web_bot_adapter.sleep"):
+            WebBotAdapter.repeatedly_attempt_to_join_meeting(adapter)
+
+    def test_admitted_on_second_knock_after_a_fresh_browser(self):
+        adapter, ui = self.adapter(MagicMock(), MagicMock(side_effect=[UiNoOneRespondedException("no one"), None]))
+        self.run_loop(adapter)
+        self.assertEqual(adapter.init_driver.call_count, 2)
+        self.assertEqual([c.args[0] for c in ui.ask_to_join.call_args_list], [1, 2])
+        adapter.after_bot_joined_meeting.assert_called_once()
+
+    def test_knocking_stops_when_the_budget_is_spent(self):
+        adapter, ui = self.adapter(MagicMock(), MagicMock(side_effect=UiNoOneRespondedException("no one")), waiting_room_timeout_seconds=900)
+        clock = iter(range(0, 100000, 100))
+        with patch(MODULE + ".time.time", side_effect=lambda: next(clock)):
+            self.run_loop(adapter)
+        adapter.after_bot_joined_meeting.assert_not_called()
+        sent = [c.args[0]["message"] for c in adapter.send_message_callback.call_args_list]
+        self.assertEqual(sent, [adapter.Messages.LEAVE_MEETING_WAITING_ROOM_TIMEOUT_EXCEEDED])
+        self.assertGreaterEqual(ui.ask_to_join.call_count, 2)

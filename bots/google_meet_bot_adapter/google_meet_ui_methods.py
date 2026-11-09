@@ -21,7 +21,7 @@ from bots.bot_sso_utils import get_google_meet_set_cookie_url
 from bots.google_meet_bot_adapter.okta_authenticator import OktaAuthenticator, OktaSessionError
 from bots.models import RecordingViews
 from bots.utils import mask_url_query_param_values
-from bots.web_bot_adapter.ui_methods import UiCouldNotClickElementException, UiCouldNotJoinMeetingWaitingForHostException, UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiCouldNotLocateElementException, UiLoginAttemptFailedException, UiLoginRequiredException, UiMeetingNotFoundException, UiRequestToJoinDeniedException, UiRetryableExpectedException
+from bots.web_bot_adapter.ui_methods import UiCouldNotClickElementException, UiCouldNotJoinMeetingWaitingForHostException, UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiCouldNotLocateElementException, UiLoginAttemptFailedException, UiLoginRequiredException, UiMeetingNotFoundException, UiInfinitelyRetryableException, UiRequestToJoinDeniedException, UiRetryableExpectedException
 
 from .mocap_manager import MocapManager
 
@@ -47,6 +47,13 @@ class UiMocapSequenceNotAvailableException(UiRetryableExpectedException):
 # knocks again while the waiting room budget lasts; if this escapes, it is
 # still reported as a denied request.
 class UiNoOneRespondedException(UiRequestToJoinDeniedException):
+    def __init__(self, message, step=None, inner_exception=None):
+        super().__init__(message, step, inner_exception)
+
+
+# Makes the outer join loop knock again in a fresh browser. It is infinitely
+# retryable: the waiting room budget, not the retry count, ends the knocking.
+class UiKnockAgainException(UiInfinitelyRetryableException):
     def __init__(self, message, step=None, inner_exception=None):
         super().__init__(message, step, inner_exception)
 
@@ -507,11 +514,6 @@ class GoogleMeetUIMethods:
                 name_input = self.retrieve_name_input_element()
                 self.check_for_failed_logged_in_bot_attempt()
                 logger.info("name input found")
-                # A knock after the first can find the previous name still filled in.
-                if name_input.get_attribute("value"):
-                    logger.info("Name input already has a value, clearing it")
-                    name_input.send_keys(Keys.CONTROL, "a")
-                    name_input.send_keys(Keys.BACKSPACE)
                 if self.ui_interaction_mode == "humanized":
                     self.humanized_navigate_to_and_click_element(name_input)
                     logger.info("Name input clicked")
@@ -1294,27 +1296,42 @@ class GoogleMeetUIMethods:
         # Meet drops an unanswered knock after ~10.5 minutes, well before our
         # waiting room timeout. Knock again until that timeout is spent, so a
         # host who is late or misses the first request can still admit us.
-        waiting_room_timeout_started_at = None
-        knock_number = 0
-        while True:
-            knock_number += 1
-            self.ask_to_join(knock_number)
-            if waiting_room_timeout_started_at is None:
-                waiting_room_timeout_started_at = time.time()
-            try:
-                self.wait_until_admitted(waiting_room_timeout_started_at)
-                break
-            except UiNoOneRespondedException:
-                seconds_left = self.automatic_leave_configuration.waiting_room_timeout_seconds - (time.time() - waiting_room_timeout_started_at)
-                if seconds_left < self.MIN_SECONDS_LEFT_TO_KNOCK_AGAIN:
-                    self.abort_join_attempt()
-                    logger.warning("No one responded and the waiting room timeout is spent. Raising UiCouldNotJoinMeetingWaitingRoomTimeoutException")
-                    raise UiCouldNotJoinMeetingWaitingRoomTimeoutException("Waiting room timeout exceeded", "wait_until_admitted")
-                logger.info(f"No one responded to knock {knock_number}. {seconds_left:.0f}s of waiting room budget left, knocking again")
+        # Every knock after the first runs in a fresh browser: the outer join
+        # loop re-inits the driver on UiKnockAgainException and comes back
+        # here, so each knock takes the same path as a first visit. The
+        # budget lives on the instance so that browser gets no new 15 minutes.
+        self.raise_if_waiting_room_budget_spent()
+        knock_number = getattr(self, "knocks_sent", 0) + 1
+        self.ask_to_join(knock_number)
+        self.knocks_sent = knock_number
+        if getattr(self, "waiting_room_timeout_started_at", None) is None:
+            self.waiting_room_timeout_started_at = time.time()
+        try:
+            self.wait_until_admitted(self.waiting_room_timeout_started_at)
+        except UiNoOneRespondedException:
+            self.raise_if_waiting_room_budget_spent()
+            logger.info(f"No one responded to knock {knock_number}. {self.waiting_room_seconds_left():.0f}s of waiting room budget left, knocking again in a fresh browser")
+            raise UiKnockAgainException(f"No one responded to knock {knock_number}", "wait_until_admitted")
 
         # Audio is only kept once the bot counts as joined, so the remaining
         # setup runs after that point (see after_admitted_setup).
         self.layout_to_select_after_admission = layout_to_select
+
+    def waiting_room_seconds_left(self):
+        started_at = getattr(self, "waiting_room_timeout_started_at", None)
+        if started_at is None:
+            return self.automatic_leave_configuration.waiting_room_timeout_seconds
+        return self.automatic_leave_configuration.waiting_room_timeout_seconds - (time.time() - started_at)
+
+    def raise_if_waiting_room_budget_spent(self):
+        # The first knock always goes out.
+        if getattr(self, "waiting_room_timeout_started_at", None) is None:
+            return
+        if self.waiting_room_seconds_left() >= self.MIN_SECONDS_LEFT_TO_KNOCK_AGAIN:
+            return
+        self.abort_join_attempt()
+        logger.warning("No one admitted us and the waiting room timeout is spent. Raising UiCouldNotJoinMeetingWaitingRoomTimeoutException")
+        raise UiCouldNotJoinMeetingWaitingRoomTimeoutException("Waiting room timeout exceeded", "ask_to_join")
 
     def ask_to_join(self, knock_number):
         logger.info(f"Knock {knock_number}: opening the meeting page")
