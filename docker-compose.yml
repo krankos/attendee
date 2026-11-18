@@ -141,7 +141,7 @@ services:
       BOT_MAX_SIMULTANEOUS_BOTS: "2"
       BOT_MEMORY_LIMIT: 1280m
       BOT_HOST_MEMORY_HEADROOM: 1g
-      BOT_CONTAINER_AUTO_REMOVE: "false"
+      BOT_CONTAINER_AUTO_REMOVE: "true"
     command:
       - celery
       - -A
