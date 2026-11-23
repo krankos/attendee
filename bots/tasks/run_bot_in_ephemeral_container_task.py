@@ -1,5 +1,7 @@
+import ipaddress
 import logging
 import os
+import secrets
 
 import docker
 from celery import Task, shared_task
@@ -11,6 +13,27 @@ logger = logging.getLogger(__name__)
 
 class BotLauncherCapacityError(Exception):
     """Raised when the maximum number of simultaneous bots is reached."""
+
+
+def random_ipv6_address(subnet: str) -> str:
+    """A random host address in subnet, never the network or gateway (::1).
+
+    Google Meet blocks anonymous guests per IP. A fresh address per bot
+    container (and per restart) keeps one flagged address from sinking
+    every following join.
+    """
+    network = ipaddress.IPv6Network(subnet)
+    host_bits = network.max_prefixlen - network.prefixlen
+    offset = secrets.randbelow(2**host_bits - 2) + 2
+    return str(network.network_address + offset)
+
+
+def ipv6_subnet_of(docker_network) -> str:
+    for config in docker_network.attrs.get("IPAM", {}).get("Config") or []:
+        subnet = config.get("Subnet", "")
+        if ":" in subnet:
+            return subnet
+    raise RuntimeError(f"Docker network {docker_network.name} has no IPv6 subnet")
 
 
 class BotLauncherTask(Task):
@@ -158,13 +181,13 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
         host_code_path = os.getenv("BOT_HOST_CODE_PATH")
         volumes = {host_code_path: {"bind": "/attendee", "mode": "ro"}} if host_code_path else {}
 
-        # Launch ephemeral container
-        container = client.containers.run(
+        # Launch ephemeral container. Created first so it can join the IPv6
+        # egress network before Chrome starts.
+        container = client.containers.create(
             image=image,
             command=command,
             name=container_name,
-            detach=True,  # Detached so task returns quickly
-            remove=auto_remove,  # Auto-remove on exit (can be disabled for debugging)
+            auto_remove=auto_remove,  # Auto-remove on exit (can be disabled for debugging)
             environment=env_vars,
             labels=labels,
             volumes=volumes,
@@ -177,6 +200,24 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
             security_opt=["seccomp=unconfined"],  # Same config as workers
             # Container will automatically stop after max_execution_seconds thanks to timeout in command
         )
+        try:
+            ipv6_network_name = os.getenv("BOT_CONTAINER_IPV6_NETWORK")
+            if ipv6_network_name:
+                ipv6_network = client.networks.get(ipv6_network_name)
+                subnet = ipv6_subnet_of(ipv6_network)
+                for attempt in range(5):
+                    address = random_ipv6_address(subnet)
+                    try:
+                        ipv6_network.connect(container, ipv6_address=address)
+                        break
+                    except docker.errors.APIError:
+                        if attempt == 4:
+                            raise
+                logger.info(f"Bot {bot_id} egresses from IPv6 {address}")
+            container.start()
+        except Exception:
+            container.remove(force=True)
+            raise
 
         # Log container info and how to view logs
         log_instruction = f"View logs with: docker logs -f {container_name}" if not auto_remove else "Container will auto-remove when done. To keep containers, set BOT_CONTAINER_AUTO_REMOVE=false"

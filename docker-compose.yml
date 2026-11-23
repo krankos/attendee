@@ -144,6 +144,11 @@ services:
       # free, so 1g headroom refused the second (overlapping) bot. Swap backs it.
       BOT_HOST_MEMORY_HEADROOM: 256m
       BOT_CONTAINER_AUTO_REMOVE: "true"
+      # Each bot gets a random address in this network's IPv6 subnet: Meet
+      # blocks guests per IP. Created by hand on the host:
+      #   docker network create --ipv6 --subnet 2a01:4f8:1c1a:ca3a:b0::/80 \
+      #     -o com.docker.network.bridge.gateway_mode_ipv6=routed attendee-bots-v6
+      BOT_CONTAINER_IPV6_NETWORK: attendee-bots-v6
     command:
       - celery
       - -A
