@@ -140,7 +140,9 @@ services:
       BOT_CONTAINER_NETWORK: ${BOT_CONTAINER_NETWORK}
       BOT_MAX_SIMULTANEOUS_BOTS: "2"
       BOT_MEMORY_LIMIT: 1280m
-      BOT_HOST_MEMORY_HEADROOM: 1g
+      # A bot uses ~0.8-1 GB. With one bot in a call the host has ~1.9-2.4 GB
+      # free, so 1g headroom refused the second (overlapping) bot. Swap backs it.
+      BOT_HOST_MEMORY_HEADROOM: 256m
       BOT_CONTAINER_AUTO_REMOVE: "true"
     command:
       - celery
